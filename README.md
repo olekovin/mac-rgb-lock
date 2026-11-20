@@ -5,7 +5,7 @@
 A small macOS menu bar app that keeps an HDMI monitor on **RGB Full** instead of the washed-out
 **YCbCr Limited** mode macOS keeps switching it back to.
 
-Apple silicon only. No dependencies, no BetterDisplay, ~350 lines of Swift.
+Apple silicon only. No dependencies, no BetterDisplay, ~400 lines of Swift.
 
 ## The problem
 
@@ -35,10 +35,15 @@ finds YCbCr.
   current timing's `ColorModes` (same bit depth preferred) and applies it with
   `IOMobileFramebufferSetDigitalOutMode`. This is the same private call BetterDisplay uses; the
   kernel logs an identical modeset for both.
-- It never switches a display that is already on RGB, and it does nothing while displays are asleep.
-  Every modeset blanks the screen for a moment.
-- Menu bar icon and panel show the display, the current mode (`8-bit RGB Full`), when it last fixed
-  it and how many times. You can pause it, trigger a fix by hand, or toggle launch at login.
+- It only touches displays you lock, never switches one that is already on RGB, and does nothing
+  while displays are asleep. Every modeset blanks the screen for a moment.
+- The panel lists every connected external display with its current mode (`8-bit RGB Full`) and a
+  lock switch. Lock as many as you like. Displays are remembered by manufacturer, product ID and
+  serial number, so two identical monitors are told apart and the choice survives reconnects.
+- On first launch, every external display connected at that moment is locked. Displays you plug in
+  later start unlocked until you switch them on.
+- The menu bar icon shows the overall state. The panel also shows when it last fixed a display and
+  how many times, and has **Fix now** and **Launch at login**.
 
 Log: `~/Library/Logs/rgb-lock.log`
 

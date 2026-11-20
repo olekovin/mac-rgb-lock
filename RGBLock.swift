@@ -45,6 +45,7 @@ func describe(_ e: Element) -> String {
 
 /// One external display's link: its framebuffer and current color/timing elements.
 struct Link {
+    let key: String  // stable across reconnects: "DEL-53501-DNJLKF3"
     let name: String
     let fb: FBRef
     let timingID: UInt32
@@ -95,8 +96,12 @@ func externalLinks(_ api: FBAPI) -> [Link] {
               let timing = timings.first(where: { int($0, "ID") == Int(timingID) })
         else { continue }
         let attrs = search(s, "DisplayAttributes") as? Element
-        let name = (attrs?["ProductAttributes"] as? Element)?["ProductName"] as? String ?? "External display"
-        links.append(Link(name: name, fb: fb, timingID: timingID, color: color,
+        let product = attrs?["ProductAttributes"] as? Element ?? [:]
+        let name = product["ProductName"] as? String ?? "External display"
+        // Serial keeps two identical monitors apart; fall back to the registry entry if there is none.
+        let serial = product["AlphanumericSerialNumber"] ?? product["SerialNumber"] ?? entry
+        let key = "\(product["ManufacturerID"] ?? "?")-\(product["ProductID"] ?? "?")-\(serial)"
+        links.append(Link(key: key, name: name, fb: fb, timingID: timingID, color: color,
                           allowed: timing["ColorModes"] as? [Element] ?? []))
     }
     return links
@@ -113,7 +118,7 @@ func externalAwake() -> Bool {
 // MARK: - App
 
 enum LinkState {
-    case locked, fixing, asleep, absent, unsupported, paused
+    case locked, fixing, asleep, absent, unsupported, unlocked
 
     var symbol: String {
         switch self {
@@ -122,7 +127,7 @@ enum LinkState {
         case .asleep: "moon.zzz"
         case .absent: "display"
         case .unsupported: "exclamationmark.triangle.fill"
-        case .paused: "pause.circle"
+        case .unlocked: "pause.circle"
         }
     }
     var title: String {
@@ -131,8 +136,8 @@ enum LinkState {
         case .fixing: "Switching to RGB…"
         case .asleep: "Display asleep"
         case .absent: "No external display"
-        case .unsupported: "Can't switch this display"
-        case .paused: "Paused"
+        case .unsupported: "Can't switch to RGB"
+        case .unlocked: "Not locking any display"
         }
     }
     var color: Color {
@@ -140,7 +145,7 @@ enum LinkState {
         case .locked: .green
         case .fixing: .orange
         case .unsupported: .red
-        case .asleep, .absent, .paused: .secondary
+        case .asleep, .absent, .unlocked: .secondary
         }
     }
 }
@@ -156,26 +161,32 @@ func log(_ s: String) {
     }
 }
 
+
+struct DisplayStatus: Identifiable {
+    let id: String  // Link.key
+    let name: String
+    let mode: String
+    let state: LinkState
+}
+
 final class Enforcer: ObservableObject {
     @Published var state = LinkState.absent
-    @Published var name = "—"
-    @Published var mode = ""
+    @Published var displays: [DisplayStatus] = []
+    @Published var locked: Set<String>
     @Published var lastFix: Date?
     @Published var fixes = 0
-    @Published var enabled = !UserDefaults.standard.bool(forKey: "paused") {
-        didSet {
-            UserDefaults.standard.set(!enabled, forKey: "paused")
-            let on = enabled
-            queue.async { self.active = on; self.tick() }
-        }
-    }
 
     private let queue = DispatchQueue(label: "rgb-lock")
-    private var active: Bool  // queue-owned copy of `enabled`
+    private var lockedQ: Set<String>  // queue-owned copy of `locked`
+    private var firstRun: Bool
     private var timer: DispatchSourceTimer?
 
     init() {
-        active = !UserDefaults.standard.bool(forKey: "paused")
+        let saved = UserDefaults.standard.stringArray(forKey: "lockedDisplays")
+        let initial = Set(saved ?? [])
+        locked = initial
+        lockedQ = initial
+        firstRun = saved == nil
         log("RGB Lock started")
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now(), repeating: 5)
@@ -186,33 +197,56 @@ final class Enforcer: ObservableObject {
 
     func fixNow() { queue.async { self.tick() } }
 
-    private func publish(_ s: LinkState, _ link: Link? = nil, fixed: Bool = false) {
-        DispatchQueue.main.async {
-            self.state = s
-            if let link { self.name = link.name; self.mode = describe(link.color) }
-            if s == .absent { self.name = "—"; self.mode = "" }
-            if fixed { self.lastFix = Date(); self.fixes += 1 }
-        }
+    func setLocked(_ key: String, _ on: Bool) {
+        if on { locked.insert(key) } else { locked.remove(key) }
+        save(locked)
+        let s = locked
+        queue.async { self.lockedQ = s; self.tick() }
     }
+
+    private func save(_ s: Set<String>) { UserDefaults.standard.set(s.sorted(), forKey: "lockedDisplays") }
 
     private func tick() {
-        guard let api = FBAPI.shared else { return publish(.unsupported) }
-        guard externalAwake() else { return publish(active ? .asleep : .paused) }
+        guard let api = FBAPI.shared else { return publish(.unsupported, nil) }
+        guard externalAwake() else { return publish(.asleep, nil) }
         let links = externalLinks(api)
-        guard !links.isEmpty else { return publish(.absent) }
-        var shown: (LinkState, Link, Bool)?
-        for link in links {
-            let result = enforce(api, link)
-            // The panel shows one display: the first one that isn't fine, else the first.
-            if shown == nil || (shown!.0 == .locked && result.0 != .locked) { shown = result }
+        if firstRun, !links.isEmpty {
+            // First run locks whatever is plugged in now; displays connected later start unlocked.
+            firstRun = false
+            lockedQ = Set(links.map(\.key))
+            let s = lockedQ
+            DispatchQueue.main.async { self.locked = s; self.save(s) }
+            log("first run: locking \(links.map(\.name).joined(separator: ", "))")
         }
-        publish(shown!.0, shown!.1, fixed: shown!.2)
+        var fixed = 0
+        let rows = links.map { link -> DisplayStatus in
+            let (state, now, didFix) = enforce(api, link)
+            if didFix { fixed += 1 }
+            return DisplayStatus(id: link.key, name: link.name, mode: describe(now.color), state: state)
+        }
+        publish(overall(rows), rows, fixed: fixed)
     }
 
-    /// Switch only when actually on YCbCr: a modeset blanks the display, never fire blindly.
+    /// Menu bar state: the worst state among locked displays.
+    private func overall(_ rows: [DisplayStatus]) -> LinkState {
+        if rows.isEmpty { return .absent }
+        let states = rows.map(\.state)
+        for s in [LinkState.fixing, .unsupported, .locked] where states.contains(s) { return s }
+        return .unlocked
+    }
+
+    private func publish(_ s: LinkState, _ rows: [DisplayStatus]?, fixed: Int = 0) {
+        DispatchQueue.main.async {
+            self.state = s
+            if let rows { self.displays = rows }
+            if fixed > 0 { self.lastFix = Date(); self.fixes += fixed }
+        }
+    }
+
+    /// Switch only locked displays that are actually on YCbCr: a modeset blanks the screen.
     private func enforce(_ api: FBAPI, _ link: Link) -> (LinkState, Link, Bool) {
+        guard lockedQ.contains(link.key) else { return (.unlocked, link, false) }
         if link.isRGB { return (.locked, link, false) }
-        guard active else { return (.paused, link, false) }
         guard let target = link.rgbTarget, let targetID = target["ID"] as? Int else {
             log("\(link.name): \(describe(link.color)), no RGB Full mode allowed for this timing")
             return (.unsupported, link, false)
@@ -221,7 +255,7 @@ final class Enforcer: ObservableObject {
         let kr = api.set(link.fb, UInt32(targetID), link.timingID)
         if kr != KERN_SUCCESS { log("set failed: 0x\(String(kr, radix: 16))") }
         sleep(2)  // the link retrains before the new mode reads back
-        let after = externalLinks(api).first { $0.name == link.name } ?? link
+        let after = externalLinks(api).first { $0.key == link.key } ?? link
         return after.isRGB ? (.locked, after, true) : (.fixing, after, false)
     }
 }
@@ -244,17 +278,40 @@ struct Panel: View {
                 }
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                row("Display", e.name)
-                row("Mode", e.mode.isEmpty ? "—" : e.mode)
-                row("Last fix", e.lastFix.map { $0.formatted(date: .omitted, time: .shortened) } ?? "—")
-                row("Fixes", "\(e.fixes)")
+            VStack(spacing: 0) {
+                if e.displays.isEmpty {
+                    Text("Connect an external display to lock it.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                }
+                ForEach(e.displays) { d in
+                    HStack(spacing: 10) {
+                        Circle().fill(d.state.color).frame(width: 8, height: 8)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(d.name).font(.callout.weight(.medium))
+                            Text(d.mode).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Toggle("Lock \(d.name)", isOn: Binding(
+                            get: { e.locked.contains(d.id) },
+                            set: { e.setLocked(d.id, $0) }))
+                            .labelsHidden()
+                            .controlSize(.small)
+                            .help("Keep \(d.name) on RGB Full")
+                    }
+                    .padding(10)
+                    if d.id != e.displays.last?.id { Divider() }
+                }
             }
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
             .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
 
-            Toggle("Keep display on RGB", isOn: $e.enabled)
+            HStack {
+                Text("Last fix \(e.lastFix.map { $0.formatted(date: .omitted, time: .shortened) } ?? "—")")
+                Spacer()
+                Text("Fixes \(e.fixes)")
+            }
+            .font(.caption).foregroundStyle(.secondary)
+
             Toggle("Launch at login", isOn: $atLogin)
                 .onChange(of: atLogin) { on in
                     do { try on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() } catch {
@@ -272,14 +329,6 @@ struct Panel: View {
         .toggleStyle(.switch)
         .padding(16)
         .frame(width: 320)
-    }
-
-    func row(_ k: String, _ v: String) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(k).foregroundStyle(.secondary).frame(width: 64, alignment: .leading)
-            Text(v).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-        }
-        .font(.caption)
     }
 }
 
